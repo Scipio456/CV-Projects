@@ -5,7 +5,7 @@ from PIL import Image
 import io
 import time
 
-class ImageEnhancer:
+class ImageEnhancer:a
     def __init__(self):
         self.initialize_ai_models()
 
