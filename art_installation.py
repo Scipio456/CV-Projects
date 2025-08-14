@@ -11,8 +11,8 @@ mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     model_complexity=0,
     max_num_hands=2,
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.5
+    min_detection_confidence=0.5,  # Lowered for faster detection
+    min_tracking_confidence=0.5   # Balanced for speed and accuracy
 )
 mp_drawing = mp.solutions.drawing_utils
 
@@ -22,8 +22,8 @@ canvas_np = np.zeros((height, width, 3), dtype=np.uint8)
 
 DRAW_COLOR = (255, 255, 255)
 thickness = 5
-points = deque(maxlen=200)
-smooth_points = deque(maxlen=7)  # Reduced for responsiveness
+points = deque(maxlen=100)  # Reduced maxlen for faster deque operations
+smooth_points = deque(maxlen=10)  # Balanced smoothing for speed
 prev_point = None
 is_paused = False
 last_gesture_time = 0
@@ -57,7 +57,7 @@ def is_open_hand(hand_landmarks):
 # Smooth coordinates
 def smooth_coordinates(x, y):
     smooth_points.append((x, y))
-    if len(smooth_points) < 7:
+    if len(smooth_points) < 10:
         return x, y
     avg_x = sum(p[0] for p in smooth_points) / len(smooth_points)
     avg_y = sum(p[1] for p in smooth_points) / len(smooth_points)
@@ -69,7 +69,7 @@ def draw_spline(canvas_np, points, color, thickness):
     if len(points) < 4:
         cv2.polylines(canvas_np, [np.array(list(points), dtype=np.int32)], False, color, thickness)
         return
-    x, y = zip(*list(points)[-10:])
+    x, y = zip(*list(points)[-8:])  # Fewer points for faster spline
     t = np.linspace(0, 1, len(x))
     try:
         fx = interpolate.interp1d(t, x, kind='cubic')
@@ -80,7 +80,7 @@ def draw_spline(canvas_np, points, color, thickness):
         spline_points = np.vstack((x_new, y_new)).T
         cv2.polylines(canvas_np, [spline_points], False, color, thickness)
     except:
-        cv2.polylines(canvas_np, [np.array(list(points)[-10:], dtype=np.int32)], False, color, thickness)
+        cv2.polylines(canvas_np, [np.array(list(points)[-8:], dtype=np.int32)], False, color, thickness)
 
 while True:
     ret, frame = cap.read()
@@ -97,7 +97,6 @@ while True:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = hands.process(rgb)
 
-    # Calculate frame rate
     current_time = time.time()
     fps = 1 / (current_time - last_time) if current_time > last_time else 0
     last_time = current_time
@@ -140,9 +139,9 @@ while True:
         prev_point = None
         print("No hand detected")
 
-    # Display pause status on canvas
+    # Display pause status on frame (to avoid artifacts on canvas)
     status_text = "PAUSED" if is_paused else "DRAWING"
-    cv2.putText(canvas_np, status_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if is_paused else (0, 255, 0), 2)
+    cv2.putText(frame, status_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if is_paused else (0, 255, 0), 2)
 
     # Overlay canvas on frame
     output = cv2.addWeighted(frame, 0.5, canvas_np, 0.5, 0)
