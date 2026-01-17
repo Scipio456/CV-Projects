@@ -1,147 +1,185 @@
-import cv2
-import mediapipe as mp
-import numpy as np
-from collections import deque
-import sys
-import time
+"""
+Hand Tracking Drawing Board (Educational Project)
 
-# Initialize MediaPipe Hands with optimized settings
+DISCLAIMER:
+This project uses a webcam ONLY for real-time processing.
+No images, videos, or biometric data are stored, saved, or transmitted.
+
+The application runs entirely on the local machine and is intended
+for educational and learning purposes only.
+
+"""
+
+import cv2
+import numpy as np
+import mediapipe as mp
+import time
+from scipy.interpolate import CubicSpline
+
+# ================= CONFIG =================
+DRAW_THICKNESS = 4
+SPLINE_POINTS = 50
+# =========================================
+
+# Colors (BGR format for OpenCV)
+COLORS = {
+    "RED": (0, 0, 255),
+    "GREEN": (0, 255, 0),
+    "BLUE": (255, 0, 0),
+    "ERASER": (0, 0, 0)
+}
+current_color = COLORS["BLUE"]
+
+# ================= MEDIAPIPE HANDS =================
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
-    model_complexity=0,  # Lighter model for faster processing
     max_num_hands=2,
+    model_complexity=0,
     min_detection_confidence=0.7,
-    min_tracking_confidence=0.5  # Balanced tracking confidence
+    min_tracking_confidence=0.7
 )
-mp_drawing = mp.solutions.drawing_utils
 
-# Set resolution for normal window
-width, height = 640, 480
-canvas_np = np.zeros((height, width, 3), dtype=np.uint8)  # OpenCV-compatible canvas
-
-DRAW_COLOR = (255, 255, 255)  # White drawing color
-thickness = 5
-smooth_points = deque(maxlen=3)  # Small smoothing window for low lag
-prev_point = None
-is_paused = False
-last_gesture_time = 0
-gesture_debounce = 0.5  # Debounce time in seconds for clear gesture
-calibrated = False
-calibrated_hand_size = 0.0
-tolerance = 0.2  # 20% tolerance for distance
-
-# Initialize Webcam
+# ================= CAMERA =================
+# Uses default system camera.
+# No frames are saved or transmitted.
 cap = cv2.VideoCapture(0)
-cap.set(3, width)
-cap.set(4, height)
+if not cap.isOpened():
+    print("Camera not accessible")
+    exit()
 
-# Check if hand is open (five fingers raised)
-def is_open_hand(hand_landmarks):
-    tips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
-    mcps = [5, 9, 13, 17]  # Corresponding MCP joints
-    thumb_tip = hand_landmarks.landmark[4]
-    thumb_mcp = hand_landmarks.landmark[2]
-    count = 0
-    for tip, mcp in zip(tips, mcps):
-        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[mcp].y - 0.02:
-            count += 1
-    if thumb_tip.x > thumb_mcp.x + 0.02:  # Thumb extended
-        count += 1
-    return count >= 5
+# ================= CANVAS =================
+canvas = None
 
-# Smooth coordinates
-def smooth_coordinates(x, y):
-    smooth_points.append((x, y))
-    if len(smooth_points) < 3:
-        return x, y
-    avg_x = sum(p[0] for p in smooth_points) / len(smooth_points)
-    avg_y = sum(p[1] for p in smooth_points) / len(smooth_points)
-    return int(avg_x), int(avg_y)
+# ================= STROKES =================
+strokes = []
+redo_stack = []
+current_stroke = []
+paused = False
 
+# ================= KALMAN FILTER =================
+kf = cv2.KalmanFilter(4, 2)
+kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                 [0, 1, 0, 0]], np.float32)
+
+kf.transitionMatrix = np.array([[1, 0, 1, 0],
+                                [0, 1, 0, 1],
+                                [0, 0, 1, 0],
+                                [0, 0, 0, 1]], np.float32)
+
+kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+
+# ================= HELPER FUNCTIONS =================
+def fingers_up(hand):
+    tips = [4, 8, 12, 16, 20]
+    fingers = []
+    fingers.append(hand[tips[0]].x < hand[tips[0] - 1].x)  # Thumb
+    for i in range(1, 5):
+        fingers.append(hand[tips[i]].y < hand[tips[i] - 2].y)
+    return fingers
+
+def is_pinch(hand):
+    return np.hypot(hand[4].x - hand[8].x,
+                    hand[4].y - hand[8].y) < 0.03
+
+def kalman_smooth(x, y):
+    kf.predict()
+    measurement = np.array([[np.float32(x)],
+                            [np.float32(y)]])
+    estimate = kf.correct(measurement)
+    return int(estimate[0]), int(estimate[1])
+
+def draw_spline(img, pts, color):
+    if len(pts) < 4:
+        return
+    pts = np.array(pts)
+    t = np.arange(len(pts))
+    csx = CubicSpline(t, pts[:, 0])
+    csy = CubicSpline(t, pts[:, 1])
+    t_new = np.linspace(0, len(pts) - 1, SPLINE_POINTS)
+
+    for i in range(len(t_new) - 1):
+        p1 = (int(csx(t_new[i])), int(csy(t_new[i])))
+        p2 = (int(csx(t_new[i + 1])), int(csy(t_new[i + 1])))
+        cv2.line(img, p1, p2, color, DRAW_THICKNESS)
+
+# ================= FPS =================
+prev_time = time.time()
+
+# ================= MAIN LOOP =================
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Error: Could not read webcam frame.")
         break
 
-    # Flip and resize frame
     frame = cv2.flip(frame, 1)
-    if frame.shape[0] != height or frame.shape[1] != width:
-        frame = cv2.resize(frame, (width, height))
+    h, w, _ = frame.shape
+
+    if canvas is None:
+        canvas = np.zeros_like(frame)
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = hands.process(rgb)
 
-    current_time = time.time()
-    right_hand_detected = False
-    current_hand_size = 0.0
     if result.multi_hand_landmarks and result.multi_handedness:
-        for hand_landmarks, hand_handedness in zip(result.multi_hand_landmarks, result.multi_handedness):
-            hand_label = hand_handedness.classification[0].label
-            # Get index finger tip coordinates
-            index_tip = hand_landmarks.landmark[8]
-            cx = int(index_tip.x * width)
-            cy = int(index_tip.y * height)
-            cx, cy = smooth_coordinates(cx, cy)
+        for i, hand_landmarks in enumerate(result.multi_hand_landmarks):
+            label = result.multi_handedness[i].classification[0].label
+            lm = hand_landmarks.landmark
+            fingers = fingers_up(lm)
 
-            if hand_label == 'Right':
-                right_hand_detected = True
-                # Calculate hand size for distance estimation
-                wrist = hand_landmarks.landmark[0]
-                middle_mcp = hand_landmarks.landmark[9]
-                dx = (middle_mcp.x - wrist.x) * width
-                dy = (middle_mcp.y - wrist.y) * height
-                current_hand_size = np.sqrt(dx**2 + dy**2)
+            # Right hand: Drawing
+            if label == "Right":
+                if fingers[1] and not paused:
+                    x, y = int(lm[8].x * w), int(lm[8].y * h)
+                    x, y = kalman_smooth(x, y)
+                    current_stroke.append((x, y))
+                elif current_stroke:
+                    strokes.append((current_stroke.copy(), current_color))
+                    current_stroke.clear()
 
-                if not is_paused and calibrated:
-                    # Check if hand is at calibrated distance (within tolerance)
-                    if abs(current_hand_size - calibrated_hand_size) / calibrated_hand_size <= tolerance:
-                        if prev_point is not None:
-                            cv2.line(canvas_np, prev_point, (cx, cy), DRAW_COLOR, thickness)
-                        prev_point = (cx, cy)
-                    else:
-                        prev_point = None
-                else:
-                    prev_point = None
-                    if is_paused:
-                        print("Drawing paused")
+            # Left hand: Controls
+            if label == "Left":
+                paused = is_pinch(lm)
 
-            elif hand_label == 'Left':
-                if is_open_hand(hand_landmarks) and (current_time - last_gesture_time) > gesture_debounce:
-                    canvas_np.fill(0)
-                    prev_point = None
-                    last_gesture_time = current_time
-                    print("Canvas cleared")
+                if all(fingers):
+                    strokes.clear()
+                    redo_stack.clear()
+                    canvas[:] = 0
 
-            # Draw landmarks and green dot
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+                if fingers == [1, 0, 0, 0, 0]:
+                    current_color = COLORS["RED"]
+                elif fingers == [0, 1, 1, 0, 0]:
+                    current_color = COLORS["GREEN"]
+                elif fingers == [0, 1, 0, 0, 1]:
+                    current_color = COLORS["BLUE"]
 
-    else:
-        prev_point = None
-        print("No hand detected")
+                if fingers == [0, 0, 0, 0, 0] and strokes:
+                    redo_stack.append(strokes.pop())
 
-    # Display pause status and calibration instruction
-    status_text = "PAUSED" if is_paused else "DRAWING"
-    cv2.putText(frame, status_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if is_paused else (0, 255, 0), 2)
-    if not calibrated:
-        cv2.putText(frame, "Hold right hand at 25cm, press 'c' to calibrate", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                if fingers == [1, 1, 0, 0, 0] and redo_stack:
+                    strokes.append(redo_stack.pop())
 
-    # Overlay canvas on frame
-    output = cv2.addWeighted(frame, 0.5, canvas_np, 0.5, 0)
+    canvas[:] = 0
+    for stroke, color in strokes:
+        draw_spline(canvas, stroke, color)
+    if current_stroke:
+        draw_spline(canvas, current_stroke, current_color)
 
-    cv2.imshow("Index Finger Drawing", output)
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:  # ESC to exit
+    fps = int(1 / (time.time() - prev_time))
+    prev_time = time.time()
+
+    output = cv2.addWeighted(frame, 0.4, canvas, 0.6, 0)
+    cv2.putText(output, f"FPS: {fps}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    cv2.putText(output,
+                "Right: Draw | Left: Controls | ESC to Exit",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    cv2.imshow("Hand Tracking Drawing Board", output)
+
+    if cv2.waitKey(1) & 0xFF == 27:
         break
-    elif key == ord(' '):  # Press spacebar to toggle pause
-        is_paused = not is_paused
-        print(f"Pause toggled: {'Paused' if is_paused else 'Resumed'}")
-    elif key == ord('c') or key == ord('C'):  # Press 'C' or 'c' to calibrate distance
-        if right_hand_detected:
-            calibrated_hand_size = current_hand_size
-            calibrated = True
-            print(f"Calibrated hand size at 25 cm: {calibrated_hand_size}")
 
 cap.release()
 cv2.destroyAllWindows()
